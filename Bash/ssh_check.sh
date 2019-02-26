@@ -24,5 +24,3 @@ then
   echo "" >> failed.txt
 fi
 done
-
-#>> checked.txt
