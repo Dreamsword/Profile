@@ -1,0 +1,266 @@
+FROM php:7.4.30-apache-buster
+
+ARG PROJECT=generic
+ARG TIMEZONE=Pacific/Auckland
+ARG SUBDOMAIN
+ARG DB_HOST 
+ARG DB_USER
+ARG DB_NAME
+ARG DB_PASS
+ARG INSTANCE_CONNECTION_NAME
+ARG CHECKABLE_CONFIG
+ARG REPORTING_CONFIG
+ARG REPORTING_ENV_JSON
+ARG NLU_KEY
+ARG STARBOARD_INI
+ARG WIDGET_INI
+ARG SQL_PROXY_KEY
+ARG STORAGE_KEY
+
+# Environmental variables
+ENV DEBIAN_FRONTEND noninteractive
+ENV DATE_TIMEZONE ${TIMEZONE}
+ENV ENVIROMENT ${PROJECT}
+ENV SUBDOMAIN ${SUBDOMAIN}
+ENV MNT_CONTENT /var/www/html/clevva/systemaccountcontent
+ENV MNT_UPLOADS /var/www/html/app/backend/uploads
+ENV MNT_STORAGE /mnt/storage
+ENV DB_HOST ${DB_HOST}
+ENV DB_USER ${DB_USER}
+ENV DB_NAME ${DB_NAME}
+ENV DB_PASS ${DB_PASS}
+ENV INSTANCE_CONNECTION_NAME ${INSTANCE_CONNECTION_NAME}
+ENV MYSQL_ATTR_SSL_CA /etc/apache2/ssl/server-ca.pem
+ENV MYSQL_ATTR_SSL_CERT /etc/apache2/ssl/client-cert.pem
+ENV MYSQL_ATTR_SSL_KEY /etc/apache2/ssl/client-key.pem
+
+# Classic update & upgrade
+RUN apt-get update && apt-get dist-upgrade -y
+
+# Install locales
+RUN apt-get install -y \ 
+    locales \
+    tzdata
+
+# Set the locale
+RUN sed -i -e 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen && \
+    locale-gen
+RUN dpkg-reconfigure --frontend noninteractive tzdata
+
+# Install required packages
+RUN apt-get install -y --no-install-recommends \
+    libbz2-dev \
+    zlib1g-dev \
+    libjpeg-dev \
+    libpng-dev \
+    libwebp-dev \
+    libfreetype6-dev \
+    libgmp-dev \
+    re2c \
+    libmhash-dev \
+    libmcrypt-dev \
+    file \
+    libc-client-dev \
+    libkrb5-dev \
+    libicu-dev \
+    libldap2-dev \
+    libonig-dev \
+    libtidy-dev \
+    libxml2-dev \
+    libxslt1-dev \
+    libzip-dev \
+    libpspell-dev \
+    vim \
+    libapache2-mod-security2 \
+    openssh-server \
+    gnupg2 \
+    lsb-release; \
+    gcsFuseRepo=gcsfuse-`lsb_release -c -s`; \
+    echo "deb http://packages.cloud.google.com/apt $gcsFuseRepo main" | \
+    tee /etc/apt/sources.list.d/gcsfuse.list; \
+    curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | \
+    apt-key add -; \
+    apt-get update; \
+    apt-get install -y gcsfuse \
+    && apt-get clean
+
+# Configure packages for this docker image
+RUN docker-php-ext-configure imap --with-kerberos --with-imap-ssl
+RUN docker-php-ext-configure gd --with-jpeg --with-webp --with-freetype
+
+# Install the required PHP Modules
+RUN docker-php-ext-install \
+    bz2 \
+    gd \ 
+    gmp \
+    imap \
+    intl \
+    ldap \
+    pdo_mysql \
+    opcache \
+    tidy \
+    xmlrpc \
+    xsl \
+    zip \
+    pspell
+
+# Install / Configure ODBC 
+RUN set -ex; \
+        docker-php-source extract; \
+        { \
+            echo '# https://github.com/docker-library/php/issues/103#issuecomment-271413933'; \
+            echo 'AC_DEFUN([PHP_ALWAYS_SHARED],[])dnl'; \
+            echo; \
+            cat /usr/src/php/ext/odbc/config.m4; \
+        } > temp.m4; \
+        mv temp.m4 /usr/src/php/ext/odbc/config.m4; \
+        apt-get update; \
+        apt-get install -y --no-install-recommends unixodbc-dev; \
+        docker-php-ext-configure odbc --with-unixODBC=shared,/usr; \
+        docker-php-ext-install odbc; \
+        docker-php-source delete; \
+        apt-get purge -y --auto-remove
+
+# Set PHP Config
+RUN set -ex; \
+    { \
+      echo "; Cloud Run / Azure enforces memory & timeouts"; \
+      echo "memory_limit = -1"; \
+      echo "max_execution_time = 60"; \
+      echo "; File upload at network limit"; \
+      echo "upload_max_filesize = 32M"; \
+      echo "post_max_size = 32M"; \
+      echo "; Configure Opcache for Containers"; \
+      echo "opcache.enable = On"; \
+      echo "opcache.validate_timestamps = Off"; \
+      echo "; Configure Opcache Memory (Application-specific)"; \
+      echo "opcache.memory_consumption = 32"; \
+      echo "; Set Timezone"; \
+      echo "date.timezone = ${DATE_TIMEZONE}"; \
+      echo "; Turn Off PHP Version Information"; \
+      echo "expose_php = Off"; \
+      echo "; Set Cookies"; \
+      echo "session.cookie_httponly On"; \
+      echo "session.cookie_secure On"; \
+      echo "session.cookie_samesite None"; \
+    } > "$PHP_INI_DIR/conf.d/clevva.ini"
+
+# Switch to the production php.ini for production operations or development for development operations
+RUN mv "$PHP_INI_DIR/php.ini-production" "$PHP_INI_DIR/php.ini"
+
+# Enable Apache Modules
+RUN a2enmod \
+    rewrite \
+    headers \
+    ssl \
+    security2
+
+# Change Allow Override for Apache
+RUN sed -i 's/\(AllowOverride\).*/\1 All/' /etc/apache2/apache2.conf
+
+# Copy run time script
+COPY Digiboost/start.sh /usr/sbin/
+
+# Set the password
+RUN echo "root:Docker!" | chpasswd
+
+# Copy the sshd_config file to the /etc/ssh/ directory
+COPY ProjectFiles/Digiboost/sshd_config /etc/ssh/
+
+# Copy and configure the ssh_setup file
+RUN mkdir -p /tmp
+COPY ProjectFiles/Digiboost/ssh_setup.sh /tmp
+RUN chmod +x /tmp/ssh_setup.sh \
+    && (sleep 1;/tmp/ssh_setup.sh 2>&1 > /dev/null)
+
+# Make changes to the apache config 
+WORKDIR /etc/apache2
+COPY ProjectFiles/Digiboost/apache_conf/ports.conf .
+
+RUN sed -i 's/\(ServerAdmin\).*/\1 devops@clevva.com/' /etc/apache2/sites-available/000-default.conf && \
+    sed -i 's/80/${PORT}/g' /etc/apache2/sites-available/000-default.conf
+
+# Turn off apache headers
+RUN set -ex; \
+    { \
+      echo " "; \
+      echo "ServerName ${ENVIROMENT}.clevva.com"; \
+      echo "ServerSignature Off"; \
+      echo "ServerTokens Prod"; \
+      echo " "; \
+      echo "<IfModule mod_headers.c>"; \
+        echo "Header always unset Server"; \
+        echo "Header unset Server"; \
+        echo "Header always unset server"; \
+        echo "Header unset server"; \
+        echo "Header always unset x-powered-by"; \
+        echo "Header unset x-powered-by"; \
+        echo "Header always unset x-cloud-trace-context"; \
+        echo "Header unset x-cloud-trace-context"; \
+      echo "</IfModule>"; \
+      echo " "; \
+      echo "<IfModule security2_module>"; \
+        echo "SecRuleEngine on"; \
+        echo "SecServerSignature Off"; \
+      echo "</IfModule>"; \
+    } >> "/etc/apache2/apache2.conf"
+
+# Update TLS and CipherSuits
+RUN sed -i 's/SSLProtocol all -SSLv3/SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1/g' /etc/apache2/mods-enabled/ssl.conf && \
+    sed -i 's/SSLCipherSuite HIGH:!aNULL/SSLCipherSuite HIGH:!aNULL:!MD5:!3DES/g' /etc/apache2/mods-enabled/ssl.conf && \
+    sed -i 's/#SSLHonorCipherOrder on/SSLHonorCipherOrder on/g' /etc/apache2/mods-enabled/ssl.conf
+
+# Copy in the Clevva code
+WORKDIR /var/www/html
+COPY clevva/ ./
+
+RUN mv db/db_config.example.php db/db_config.php
+
+# Prepare reporting api
+WORKDIR /var/www/html/reporting
+ADD ${REPORTING_CONFIG} ./
+ADD ${REPORTING_ENV_JSON} ./
+
+RUN mv .reporting_env .env && \
+    mv .reporting_env_json .env.json
+RUN php artisan optimize
+
+# Copy in Checkable code
+RUN mkdir -p checkable
+WORKDIR /var/www/html/checkable
+COPY checkable/ ./
+
+ADD ${CHECKABLE_CONFIG} ./
+
+RUN mkdir -p ./storage/credentials
+ADD ${NLU_KEY} ./storage/credentials
+
+RUN php artisan optimize
+
+# Copy in the Starboard Configs
+WORKDIR /var/www/html/starboard/ini
+ADD ${STARBOARD_INI} ./
+
+# Copy in the Widget Configs
+WORKDIR /var/www/html/widget/ini
+ADD ${WIDGET_INI} ./
+
+# Copy the Cloud_SQL_Proxy
+WORKDIR /usr/sbin/
+COPY ProjectFiles/Digiboost/cloud_sql_proxy /usr/sbin
+ADD ${SQL_PROXY_KEY} ./
+ADD ${STORAGE_KEY} ./
+
+RUN chmod +x cloud_sql_proxy 
+
+# Switch back to the code top level
+WORKDIR /var/www/html
+
+# Cleanup
+RUN rm -r /var/lib/apt/lists/*
+
+# Set permissions
+RUN chmod +x /usr/sbin/start.sh
+RUN chown -R www-data:www-data /var/www/html
+
+CMD ["/usr/sbin/start.sh"]

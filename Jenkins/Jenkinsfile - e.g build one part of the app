@@ -1,0 +1,80 @@
+pipeline {
+    agent {
+        node { 
+           label 'clevva-build-image'
+           } 
+    }
+
+    stages{
+        stage('Build Clevva') {
+            steps {
+                withCredentials([string(credentialsId: 'github-devops-token', variable: 'githubToken')]) {
+                    sh "git clone --branch ${BRANCH} https://${githubToken}@github.com/Clevva-SA/clevva.git"
+                }
+
+                dir('clevva') {
+                    sh '''
+                        npm install --silent 
+                        npm run --silent build
+                        php live/db_migrate/gen.php
+
+                        ./.github/workflows/scripts/auto-deploy-local.sh --path="app"
+                        mkdir www-root
+                        rsync -Cazpq --delete features/www-root/* www-root
+                        rsync -Cazpq --delete features/www-root/.[^.]* www-root
+                        rm app/shared/vendor/.gitignore
+
+                        tag=$(git describe --abbrev=0)
+                        rm -rf app/*.*.*.version
+                        touch app/$tag.version
+                    '''
+                    dir('app') {
+                        stash name: 'app', includes: '**'
+                    }
+                    dir('www-root') {
+                        stash name: 'www-root', includes: '**'
+                    }
+                }
+            }
+        }
+
+        stage('Publish build') {
+            steps {
+                dir('release') {
+                    withCredentials([string(credentialsId: 'github-devops-token', variable: 'githubToken')]) {
+                        sh "git clone --branch ${DEPLOY} https://${githubToken}@github.com/Clevva-SA/deploy.git ."
+                    }
+                    
+                    sh 'mkdir -p app_new'
+
+                    dir('app_new') {
+                        unstash 'app'
+                    }
+                    
+                    dir('app') {
+                        sh 'rsync -va --delete ../app_new/* .'
+
+                        dir('backend') {
+                            sh '''
+                                mkdir -p file_uploads ftp_temp_upload import_uploads
+
+                                touch file_uploads/.gitkeep ftp_temp_upload/.gitkeep import_uploads/.gitkeep
+                            '''
+                        }       
+                    }
+
+                    unstash 'www-root'
+                    
+                    sh """
+                        rm -rf app_new
+                        git add -A
+                        git config user.email "devops@clevva.com"
+                        git config user.name "Clevva-Devops"
+                        git commit -m "Update sources"
+                        git push origin ${DEPLOY}
+                    """
+                }
+            }
+        }
+    }
+}
